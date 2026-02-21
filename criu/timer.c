@@ -296,6 +296,10 @@ static int core_alloc_posix_timers(TaskTimersEntry *tte, int n, PosixTimerEntry 
 	return 0;
 }
 
+/*
+ * Returns 0 on success, 1 if the timer should be skipped (dead notify
+ * thread), or -1 on error.
+ */
 static int encode_notify_thread_id(pid_t rtid, struct pstree_item *item, PosixTimerEntry *pte)
 {
 	pid_t vtid = 0;
@@ -305,7 +309,15 @@ static int encode_notify_thread_id(pid_t rtid, struct pstree_item *item, PosixTi
 		return 0;
 
 	if (!(root_ns_mask & CLONE_NEWPID)) {
-		/* Non-pid-namespace case */
+		/* Non-pid-namespace case: verify the thread is alive */
+		for (i = 0; i < item->nr_threads; i++) {
+			if (item->threads[i].real == rtid)
+				break;
+		}
+		if (i == item->nr_threads) {
+			pr_warn("Skipping timer: notify thread %d is dead\n", rtid);
+			return 1;
+		}
 		pte->notify_thread_id = rtid;
 		pte->has_notify_thread_id = true;
 		return 0;
@@ -326,8 +338,8 @@ static int encode_notify_thread_id(pid_t rtid, struct pstree_item *item, PosixTi
 	}
 
 	if (vtid == 0) {
-		pr_err("Unable to convert the notify thread id %d\n", rtid);
-		return -1;
+		pr_warn("Skipping timer: notify thread %d is dead\n", rtid);
+		return 1;
 	}
 
 	pte->notify_thread_id = vtid;
@@ -351,10 +363,7 @@ static int encode_posix_timer(struct pstree_item *item, struct posix_timer *v, s
 	pte->vsec = v->val.it_value.tv_sec;
 	pte->vnsec = v->val.it_value.tv_nsec;
 
-	if (encode_notify_thread_id(vp->spt.notify_thread_id, item, pte))
-		return -1;
-
-	return 0;
+	return encode_notify_thread_id(vp->spt.notify_thread_id, item, pte);
 }
 
 int parasite_dump_posix_timers_seized(struct proc_posix_timers_stat *proc_args, struct parasite_ctl *ctl,
@@ -367,7 +376,7 @@ int parasite_dump_posix_timers_seized(struct proc_posix_timers_stat *proc_args, 
 	struct parasite_dump_posix_timers_args *args;
 	int ret, exit_code = -1;
 	int args_size;
-	int i;
+	int i, j;
 
 	if (core_alloc_posix_timers(tte, proc_args->timer_n, &pte))
 		return -1;
@@ -387,13 +396,22 @@ int parasite_dump_posix_timers_seized(struct proc_posix_timers_stat *proc_args, 
 		goto end_posix;
 
 	i = 0;
+	j = 0;
 	list_for_each_entry(temp, &proc_args->timers, list) {
-		posix_timer_entry__init(&pte[i]);
-		if (encode_posix_timer(item, &args->timer[i], temp, &pte[i]))
+		posix_timer_entry__init(&pte[j]);
+		ret = encode_posix_timer(item, &args->timer[i], temp, &pte[j]);
+		if (ret < 0)
 			goto end_posix;
-		tte->posix[i] = &pte[i];
+		if (ret == 1) {
+			/* Dead notify thread, skip this timer */
+			i++;
+			continue;
+		}
+		tte->posix[j] = &pte[j];
 		i++;
+		j++;
 	}
+	tte->n_posix = j;
 
 	exit_code = 0;
 end_posix:
