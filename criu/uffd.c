@@ -1442,9 +1442,6 @@ int cr_lazy_pages(bool daemon)
 		}
 	}
 
-	if (status_ready())
-		return -1;
-
 	/*
 	 * we poll nr_tasks userfault fds, UNIX socket between lazy-pages
 	 * daemon and the cr-restore, and, optionally TCP socket for
@@ -1465,6 +1462,22 @@ int cr_lazy_pages(bool daemon)
 			xfree(events);
 			return -1;
 		}
+	}
+
+	/*
+	 * Signal --status-fd ready only after the page-server connection is
+	 * established (when --page-server is in use). The original placement
+	 * before connect_to_page_server_to_recv() let a lazy-pages daemon
+	 * report ready while still racing to connect to the source. If the
+	 * connect later failed, the caller had already proceeded to restore
+	 * and the uffd handler would hang on the first page fault. Postponing
+	 * ready means a bogus or unreachable page-server endpoint surfaces as
+	 * a daemon-exit-before-ready on the status pipe, which the caller can
+	 * treat as a clean fresh-start fallback signal.
+	 */
+	if (status_ready()) {
+		xfree(events);
+		return -1;
 	}
 
 	ret = handle_requests(epollfd, &events, nr_fds);
